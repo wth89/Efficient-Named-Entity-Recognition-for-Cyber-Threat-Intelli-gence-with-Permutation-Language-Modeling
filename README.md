@@ -57,24 +57,28 @@
 
 ---
 
+
+
 ## 📁 项目结构
 
-├── xlnet_crf_cti.py          # CTI 训练脚本
- ├── xlnet_crf_dnrti.py        # DNRTI 训练脚本
- ├── xlnet_crf_malware.py      # Malware 训练脚本
- ├── predict.py                # 预测与推理脚本
- ├── print_metric_cti.py       # CTI 评估图表生成
- ├── print_metric_dnrti.py     # DNRTI 评估图表生成
- ├── print_metric_malware.py   # Malware 评估图表生成
- ├── datasets/                 # 数据目录
- │   ├── CTI-reports/
- │   ├── DNRTI/
- │   └── MalwareTextDB/
- └── outputs/
- ├── 训练日志文件
- ├── 模型检查点
- └── 性能图表
+```text
+├── xlnet_crf_cti.py           # CTI 训练脚本
+├── xlnet_crf_dnrti.py         # DNRTI 训练脚本
+├── xlnet_crf_malware.py       # Malware 训练脚本
+├── predict.py                 # 预测与推理脚本
+├── print_metric_cti.py        # CTI 评估图表生成
+├── print_metric_dnrti.py      # DNRTI 评估图表生成
+├── print_metric_malware.py    # Malware 评估图表生成
+├── datasets/                  # 数据目录
+│   ├── CTI-reports/
+│   ├── DNRTI/
+│   └── MalwareTextDB/
+└── outputs/
+    ├── 训练日志文件
+    ├── 模型检查点
+    └── 性能图表
 
+```
 ---
 
 ## 📦 安装依赖
