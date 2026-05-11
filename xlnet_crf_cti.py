@@ -4,7 +4,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import BertModel,BertPreTrainedModel,AutoTokenizer
+from transformers import BertModel,BertPreTrainedModel,AutoTokenizer,AutoModel
 import os
 from torch.utils import data
 import torch.optim as optim
@@ -15,8 +15,8 @@ import numpy as np
 
 
 max_seq_length = 256
-batch_size = 32
-gradient_accumulation_steps = 1
+batch_size = 8
+gradient_accumulation_steps = 4
 total_train_epochs = 80
 
 output_dir = r'./outputs/'
@@ -308,7 +308,7 @@ class NerDataset(data.Dataset):
         input_ids_list = torch.LongTensor(f(0, maxlen))
         input_mask_list = torch.LongTensor(f(1, maxlen))
         segment_ids_list = torch.LongTensor(f(2, maxlen))
-        predict_mask_list = torch.ByteTensor(f(3, maxlen))
+        predict_mask_list = torch.BoolTensor(f(3, maxlen))
         label_ids_list = torch.LongTensor(f(4, maxlen))
 
         return input_ids_list, input_mask_list, segment_ids_list, predict_mask_list, label_ids_list
@@ -332,7 +332,7 @@ print("  Batch size = %d"% batch_size)
 print("  Num steps = %d"% total_train_steps)
 
 
-bert_model_scale = 'xlnet-base-cased'
+bert_model_scale = 'xlnet/xlnet-base-cased'
 tokenizer = AutoTokenizer.from_pretrained(bert_model_scale, do_lower_case=True)
 
 
@@ -343,19 +343,19 @@ test_dataset = NerDataset(test_examples,tokenizer,label_map,max_seq_length)
 train_dataloader = data.DataLoader(dataset=train_dataset,
                                 batch_size=batch_size,
                                 shuffle=True,
-                                num_workers=4,
+                                num_workers=0,
                                 collate_fn=NerDataset.pad)
 
 dev_dataloader = data.DataLoader(dataset=dev_dataset,
                                 batch_size=batch_size,
                                 shuffle=True,
-                                num_workers=4,
+                                num_workers=0,
                                 collate_fn=NerDataset.pad)
 
 test_dataloader = data.DataLoader(dataset=test_dataset,
                                 batch_size=batch_size,
                                 shuffle=True,
-                                num_workers=4,
+                                num_workers=0,
                                 collate_fn=NerDataset.pad)
 
 
@@ -363,7 +363,12 @@ test_dataloader = data.DataLoader(dataset=test_dataset,
 
 
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+    device = torch.device("cuda:0")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
 
 
 
@@ -407,6 +412,90 @@ def log_sum_exp_batch(log_Tensor, axis=-1): # shape (batch_size,n,m)
 
 
 
+# TENER components
+
+class RelativePositionEncoding(nn.Module):
+    def __init__(self, d_head, max_len=512):
+        super().__init__()
+        self.d_head = d_head
+        # learnable relative position embeddings: indices 0..2*max_len-2
+        # index = relative_distance + (max_len - 1)
+        self.embedding = nn.Embedding(2 * max_len - 1, d_head)
+        self.max_len = max_len
+
+    def forward(self, seq_len):
+        # returns (seq_len, seq_len, d_head)
+        range_vec = torch.arange(seq_len, device=self.embedding.weight.device)
+        distance = range_vec.unsqueeze(0) - range_vec.unsqueeze(1)  # (seq_len, seq_len)
+        distance = distance.clamp(-(self.max_len - 1), self.max_len - 1)
+        indices = distance + (self.max_len - 1)
+        return self.embedding(indices)  # (seq_len, seq_len, d_head)
+
+
+class TENERLayer(nn.Module):
+    def __init__(self, d_model=768, num_heads=8, dropout=0.2, max_len=512):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_head = d_model // num_heads
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        self.rel_pos_enc = RelativePositionEncoding(self.d_head, max_len)
+
+        self.attn_dropout = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * d_model, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x, mask=None):
+        # x: (batch, seq_len, d_model)
+        # mask: (batch, seq_len) — 1 for real tokens, 0 for padding
+        B, T, _ = x.size()
+        H, D = self.num_heads, self.d_head
+
+        Q = self.q_proj(x).view(B, T, H, D)  # (B, T, H, D)
+        K = self.k_proj(x).view(B, T, H, D)
+        V = self.v_proj(x).view(B, T, H, D)
+
+        # content-based score: Q·K^T  (B, H, T, T)
+        content_score = torch.einsum('bihd,bjhd->bhij', Q, K)
+
+        # position-based score: Q·R^T  (B, H, T, T)
+        R = self.rel_pos_enc(T)  # (T, T, D)
+        pos_score = torch.einsum('bihd,ijd->bhij', Q, R)
+
+        # no sqrt(d_k) scaling — TENER paper finding
+        attn_score = content_score + pos_score  # (B, H, T, T)
+
+        if mask is not None:
+            # mask out padding positions: set to -1e9
+            pad_mask = (mask == 0).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
+            attn_score = attn_score.masked_fill(pad_mask, -1e9)
+
+        attn_weight = torch.softmax(attn_score, dim=-1)
+        attn_weight = self.attn_dropout(attn_weight)
+
+        out = torch.einsum('bhij,bjhd->bihd', attn_weight, V)  # (B, T, H, D)
+        out = out.contiguous().view(B, T, self.d_model)
+        out = self.out_proj(out)
+
+        x = self.norm1(x + out)
+        x = self.norm2(x + self.ffn(x))
+        return x
+
+
 # Build NER model
 
 class NER_MODEL(nn.Module):
@@ -424,6 +513,7 @@ class NER_MODEL(nn.Module):
         # use pretrainded BertModel
         self.bert = bert_model
         self.dropout = torch.nn.Dropout(0.2)
+        self.tener = TENERLayer(d_model=768, num_heads=8, dropout=0.2)
         # Maps the output of the bert into label space.
         self.hidden2label = nn.Linear(self.hidden_size, self.num_labels)
 
@@ -482,8 +572,9 @@ class NER_MODEL(nn.Module):
         '''
         sentances -> word embedding -> lstm -> MLP -> feats
         '''
-        bert_seq_out, _ = self.bert(input_ids, token_type_ids=segment_ids, attention_mask=input_mask,return_dict=False)
+        bert_seq_out = self.bert(input_ids, token_type_ids=segment_ids, attention_mask=input_mask,return_dict=False)[0]
         bert_seq_out = self.dropout(bert_seq_out)
+        bert_seq_out = self.tener(bert_seq_out, input_mask)
         bert_feats = self.hidden2label(bert_seq_out)
         return bert_feats
 
@@ -500,7 +591,7 @@ class NER_MODEL(nn.Module):
         batch_transitions = self.transitions.expand(batch_size,self.num_labels,self.num_labels)
         batch_transitions = batch_transitions.flatten(1)
 
-        score = torch.zeros((feats.shape[0],1)).to(device)
+        score = torch.zeros((feats.shape[0],1)).to(self.device)
         # the 0th node is start_label->start_word,the probability of them=1. so t begin with 1.
         for t in range(1, T):
             score = score + \
@@ -565,7 +656,7 @@ class NER_MODEL(nn.Module):
 
 start_label_id = Data_Processor.get_start_label_id()
 stop_label_id = Data_Processor.get_stop_label_id()
-bert_model = BertModel.from_pretrained('xlnet-base-cased')
+bert_model = AutoModel.from_pretrained(bert_model_scale)
 model = NER_MODEL(bert_model, start_label_id, stop_label_id, len(label_list), max_seq_length, batch_size, device)
 start_epoch = 0
 valid_acc_prev = 0
@@ -726,7 +817,7 @@ for epoch in range(start_epoch, total_train_epochs):
     if valid_f1 > valid_f1_prev:
         torch.save({'epoch': epoch, 'model_state': model.state_dict(), 'valid_acc': valid_acc,
             'valid_f1': valid_f1, 'max_seq_length': max_seq_length, 'lower_case': False},
-                    os.path.join(output_dir, 'xlnet_crf_cti_checkpoint.pt'))
+                    os.path.join(output_dir, 'xlnet_tener_crf_cti_checkpoint.pt'))
         valid_f1_prev = valid_f1
     
     # Save results
@@ -734,7 +825,7 @@ for epoch in range(start_epoch, total_train_epochs):
         epoch, tr_loss, valid_acc, valid_precision, valid_recall, valid_f1))
 
 # Save results to a .txt file
-output_file = './outputs/cti_train.txt'
+output_file = './outputs/cti_tener_train.txt'
 os.makedirs(os.path.dirname(output_file), exist_ok=True)
 with open(output_file, 'w') as f:
     f.write("Epoch,Training Loss,Validation Acc,Validation Precision,Validation Recall,Validation F1\n")
@@ -787,7 +878,7 @@ def testModel(model, dataloader, label_list):
     precision, recall, f1 = f1_score(np.array(all_labels), np.array(all_preds))
 
     # 保存预测和真实标签到文件
-    output_file = './outputs/cti_test.txt'
+    output_file = './outputs/cti_tener_test.txt'
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, 'w') as f:
         for true, pred in zip(all_labels, all_preds):
